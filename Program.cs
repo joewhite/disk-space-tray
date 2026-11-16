@@ -1,8 +1,12 @@
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.Globalization;
-using System.Runtime.InteropServices;
+using System.IO;
 using System.Text.Json;
+using System.Windows.Threading;
+using Windows.Win32;
+using Windows.Win32.Foundation;
+using Windows.Win32.UI.WindowsAndMessaging;
 
 namespace DiskSpaceTray;
 
@@ -35,34 +39,85 @@ sealed class Settings
     }
 }
 
-sealed class TrayContext : ApplicationContext
+sealed class TrayContext : IDisposable
 {
-    [DllImport("user32.dll")] static extern bool DestroyIcon(IntPtr handle);
-
     const double MiB = 1024.0 * 1024, GiB = MiB * 1024, TiB = GiB * 1024;
 
     readonly Settings _s = Settings.Load();
-    readonly NotifyIcon _tray;
-    readonly System.Windows.Forms.Timer _timer;
-    readonly System.Windows.Forms.Timer _flashTimer;
+    readonly TrayIcon _tray;
+    readonly ContextMenuStrip _menu = new();
+    readonly HoverPopup _popup = new();
+    readonly DispatcherTimer _timer;
+    readonly DispatcherTimer _flashTimer;
+    // Runs only while the mouse hovers the tray icon: confirms the cursor is still over it.
+    readonly DispatcherTimer _hoverTimer;
     IntPtr _hIcon;
     string _text = "?";
+    string _tip = "";
     Color _back = Color.Gray, _fore = Color.White;
     bool _isRed, _flashDark;
 
     public TrayContext()
     {
-        var menu = new ContextMenuStrip();
-        menu.Items.Add("Exit", null, (_, _) => ExitThread());
+        _menu.Items.Add("Exit", null, (_, _) => System.Windows.Application.Current.Shutdown());
 
-        _tray = new NotifyIcon { ContextMenuStrip = menu, Visible = true };
-        _timer = new System.Windows.Forms.Timer { Interval = (int)Math.Max(250, _s.UpdateIntervalSeconds * 1000) };
+        _tray = new TrayIcon();
+        _tray.PopupOpen += OnPopupOpen;
+        _tray.PopupClose += EndHover;
+        _tray.ContextMenuRequested += ShowMenu;
+
+        _hoverTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
+        _hoverTimer.Tick += (_, _) => { if (!CursorOverIcon()) EndHover(); };
+
+        _timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(Math.Max(250, _s.UpdateIntervalSeconds * 1000)) };
         _timer.Tick += (_, _) => Refresh();
         _timer.Start();
-        _flashTimer = new System.Windows.Forms.Timer { Interval = (int)Math.Max(50, _s.FlashIntervalSeconds * 1000) };
+        _flashTimer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(Math.Max(50, _s.FlashIntervalSeconds * 1000)) };
         _flashTimer.Tick += (_, _) => { _flashDark = !_flashDark; if (_isRed) Redraw(); };
         if (_s.FlashIntervalSeconds > 0) _flashTimer.Start();
         Refresh();
+    }
+
+    void OnPopupOpen()
+    {
+        // Trust the shell's hover notification: its hot area can be larger than the icon rect
+        // that Shell_NotifyIconGetRect reports, so don't second-guess it with a bounds check here.
+        // If the rect is unavailable, anchor on the cursor instead.
+        var rect = _tray.GetRect() ?? CursorRect();
+        _popup.ShowNear(rect);
+        _hoverTimer.Start();
+    }
+
+    static RECT CursorRect()
+    {
+        PInvoke.GetCursorPos(out var p);
+        return new RECT { left = p.X - 8, top = p.Y - 8, right = p.X + 8, bottom = p.Y + 8 };
+    }
+
+    void EndHover()
+    {
+        _hoverTimer.Stop();
+        _popup.HidePopup();
+    }
+
+    // Safety net for a missed NIN_POPUPCLOSE. The shell's hover area extends past the reported icon
+    // rect (e.g. the highlighted cell in the overflow flyout), so test against a generously inflated
+    // rect; NIN_POPUPCLOSE remains the primary exit signal. If the rect is unavailable, assume inside.
+    bool CursorOverIcon()
+    {
+        if (_tray.GetRect() is not { } r) return true;
+        int margin = Math.Max(r.Width, r.Height);
+        return PInvoke.GetCursorPos(out var p)
+            && p.X >= r.left - margin && p.X < r.right + margin
+            && p.Y >= r.top - margin && p.Y < r.bottom + margin;
+    }
+
+    void ShowMenu(Point screenPoint)
+    {
+        EndHover();
+        // The owner window must be foreground or the menu won't dismiss when clicking elsewhere.
+        PInvoke.SetForegroundWindow(new HWND(_tray.Handle));
+        _menu.Show(screenPoint);
     }
 
     void Refresh()
@@ -90,8 +145,9 @@ sealed class TrayContext : ApplicationContext
         if (!red) _flashDark = false;
         Redraw();
 
-        var tip = double.IsNaN(free) ? $"{_s.Drive} unavailable" : $"{_s.Drive} {free / GiB:0.00} GiB free";
-        _tray.Text = tip.Length > 127 ? tip[..127] : tip;
+        _tip = double.IsNaN(free) ? $"{_s.Drive} unavailable" : $"{_s.Drive} {free / GiB:0.00} GiB free";
+        _tray.SetTip(_tip);
+        _popup.Text = _tip + "\n\n(Top page-file users will be listed here.)";
     }
 
     void Redraw()
@@ -100,8 +156,8 @@ sealed class TrayContext : ApplicationContext
         var old = _hIcon;
         using (var bmp = Render(_text, back, _fore, _s.HorizontalPaddingPercent, _s.VerticalPaddingPercent))
             _hIcon = bmp.GetHicon();
-        _tray.Icon = Icon.FromHandle(_hIcon);
-        if (old != IntPtr.Zero) DestroyIcon(old);
+        _tray.SetIcon(_hIcon);
+        if (old != IntPtr.Zero) PInvoke.DestroyIcon(new HICON(old));
     }
 
     // At least 2 significant digits, unit letter M (MiB), G (GiB) or T (TiB).
@@ -153,14 +209,15 @@ sealed class TrayContext : ApplicationContext
         return bmp;
     }
 
-    protected override void ExitThreadCore()
+    public void Dispose()
     {
         _timer.Stop();
         _flashTimer.Stop();
-        _tray.Visible = false;
+        _hoverTimer.Stop();
+        _popup.Close();
         _tray.Dispose();
-        if (_hIcon != IntPtr.Zero) DestroyIcon(_hIcon);
-        base.ExitThreadCore();
+        _menu.Dispose();
+        if (_hIcon != IntPtr.Zero) PInvoke.DestroyIcon(new HICON(_hIcon));
     }
 }
 
@@ -169,7 +226,9 @@ static class Program
     [STAThread]
     static void Main()
     {
-        ApplicationConfiguration.Initialize();
-        Application.Run(new TrayContext());
+        ApplicationConfiguration.Initialize(); // sets PerMonitorV2 before WPF starts
+        var app = new System.Windows.Application { ShutdownMode = System.Windows.ShutdownMode.OnExplicitShutdown };
+        using var tray = new TrayContext();
+        app.Run();
     }
 }
