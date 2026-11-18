@@ -17,7 +17,45 @@ sealed class HoverPopup : Window
 {
     readonly Border _root;
     readonly TextBlock _text;
+    readonly Grid _barGrid;
+    readonly Border _pageSeg, _freeSeg, _freeSwatch;
+    readonly TextBlock _pageLabel, _freeLabel;
     RECT _anchor;
+
+    static readonly System.Windows.Media.Brush PageBrush = Frozen(230, 140, 20);
+    static readonly System.Windows.Media.Brush FreeBrush = Frozen(0, 130, 0);
+
+    static System.Windows.Media.Brush Frozen(byte r, byte g, byte b)
+    {
+        var br = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(r, g, b));
+        br.Freeze();
+        return br;
+    }
+
+    static StackPanel Legend(Border swatch, TextBlock label)
+    {
+        swatch.Width = swatch.Height = 10;
+        swatch.Margin = new Thickness(0, 0, 5, 0);
+        var sp = new StackPanel { Orientation = System.Windows.Controls.Orientation.Horizontal };
+        sp.Children.Add(swatch);
+        sp.Children.Add(label);
+        return sp;
+    }
+
+    /// <summary>Sets the stacked bar: page file size vs. free space, in bytes plus their display labels.</summary>
+    public void SetBar(double pageBytes, string pageText, double freeBytes, string freeText, System.Drawing.Color freeColor)
+    {
+        var brush = Frozen(freeColor.R, freeColor.G, freeColor.B);
+        _freeSeg.Background = brush;
+        _freeSwatch.Background = brush;
+        double p = double.IsNaN(pageBytes) ? 0 : Math.Max(0, pageBytes);
+        double f = double.IsNaN(freeBytes) ? 0 : Math.Max(0, freeBytes);
+        if (p + f <= 0) { p = 0; f = 1; }
+        _barGrid.ColumnDefinitions[0].Width = new GridLength(p, GridUnitType.Star);
+        _barGrid.ColumnDefinitions[1].Width = new GridLength(f, GridUnitType.Star);
+        _pageLabel.Text = "Page file " + pageText;
+        _freeLabel.Text = "Free " + freeText;
+    }
 
     public HoverPopup()
     {
@@ -32,15 +70,40 @@ sealed class HoverPopup : Window
 
         _text = new TextBlock
         {
-            Margin = new Thickness(10, 8, 10, 8),
+            Margin = new Thickness(0, 8, 0, 0),
             Foreground = System.Windows.SystemColors.WindowTextBrush,
         };
+
+        _barGrid = new Grid { Height = 14, Width = 240 };
+        _barGrid.ColumnDefinitions.Add(new ColumnDefinition());
+        _barGrid.ColumnDefinitions.Add(new ColumnDefinition());
+        _pageSeg = new Border { Background = PageBrush };
+        _freeSeg = new Border { Background = FreeBrush };
+        Grid.SetColumn(_freeSeg, 1);
+        _barGrid.Children.Add(_pageSeg);
+        _barGrid.Children.Add(_freeSeg);
+
+        _pageLabel = new TextBlock { Foreground = System.Windows.SystemColors.WindowTextBrush };
+        _freeLabel = new TextBlock { Foreground = System.Windows.SystemColors.WindowTextBrush };
+        var legend = new DockPanel { Margin = new Thickness(0, 4, 0, 0), LastChildFill = false };
+        var pageKey = Legend(new Border { Background = PageBrush }, _pageLabel);
+        _freeSwatch = new Border { Background = FreeBrush };
+        var freeKey = Legend(_freeSwatch, _freeLabel);
+        DockPanel.SetDock(freeKey, Dock.Right);
+        legend.Children.Add(pageKey);
+        legend.Children.Add(freeKey);
+
+        var stack = new StackPanel { Margin = new Thickness(10, 8, 10, 8) };
+        stack.Children.Add(_barGrid);
+        stack.Children.Add(legend);
+        stack.Children.Add(_text);
+
         _root = new Border
         {
             Background = System.Windows.SystemColors.WindowBrush,
             BorderBrush = System.Windows.SystemColors.ActiveBorderBrush,
             BorderThickness = new Thickness(1),
-            Child = _text,
+            Child = stack,
         };
         Content = _root;
 

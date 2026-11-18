@@ -147,7 +147,13 @@ sealed class TrayContext : IDisposable
 
         _tip = double.IsNaN(free) ? $"{_s.Drive} unavailable" : $"{_s.Drive} {free / GiB:0.00} GiB free";
         _tray.SetTip(_tip);
-        _popup.Text = _tip + "\n\n(Top page-file users will be listed here.)";
+        // Only the size is needed; FileInfo.Length reads metadata without opening the locked file.
+        double page;
+        try { page = new FileInfo(Path.Combine(_s.Drive, "pagefile.sys")).Length; }
+        catch { page = 0; }
+        _popup.SetBar(page, $"{page / GiB:0.0} GiB", double.IsNaN(free) ? 0 : free,
+            double.IsNaN(free) ? "?" : $"{free / GiB:0.0} GiB", back);
+        _popup.Text = "(Top page-file users will be listed here.)";
     }
 
     void Redraw()
